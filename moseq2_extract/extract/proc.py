@@ -8,9 +8,14 @@ import joblib
 import scipy.stats
 import numpy as np
 import scipy.signal
-import skimage.measure
 import scipy.interpolate
+import skimage.measure
 import skimage.morphology
+from skimage import color
+from skimage.transform import hough_ellipse
+from skimage.feature import canny
+from skimage.draw import circle_perimeter, ellipse_perimeter, ellipse
+from skimage.util import img_as_ubyte
 from copy import deepcopy
 from tqdm.auto import tqdm
 import moseq2_extract.io.video
@@ -129,14 +134,227 @@ def get_bground_im_file(frames_file, frame_stride=500, med_scale=5, output_dir=N
                                                           **kwargs).squeeze()
             frame_store.append(cv2.medianBlur(frs, med_scale))
 
+        
+        
         bground = np.nanmedian(frame_store, axis=0)
-
+        
+        # JP edit
+        if kwargs.get('remove_obj_from_bg', False):
+            
+            print('Removing object from background via RANSAC plane interpolation... (takes a few mins)'
+            
+            # Get any relevant params passed, otherwise set defaults (are also set within the fns)
+            floor_pctile = kwargs.pop('floor_pctile', 99)
+            floor_range = kwargs.pop('floor_range', 50) # in mm
+            erosion_size = kwargs.pop('erosion_size', 6) # size of strel disk in pixels
+            
+            # Set path to save intermediate output images
+            if output_dir is None:
+                obj_removal_path = join(dirname(frames_file), 'proc', 'obj_removal')
+            else:
+                obj_removal_path = join(output_dir, 'obj_removal')
+                
+            # Run the algorithm to interpolate the floor (RANSAC plane) underneath the object
+            interp_bkgd, best_plane, ellipse_params = interp_elliptical_floor(bkgd, save_dir=obj_removal_path)
+            bground = interp_bkgd
+            
         write_image(bground_path, bground, scale=True)
     else:
         bground = read_image(bground_path, scale=True)
         
     return bground
 
+                  
+# JP Functions for object removal from bg
+
+# Main function
+def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.', erosion_size=6):
+    """
+    Use RANSAC plane fitting to interpolate the floor underneath an object in the MOSEQ background.
+    
+    Inputs:
+        bkgd (np.array): median-filtered background image
+        floor_pctile (int): parameter used to distinguish the floor from the object. Usually close to 100.
+        floor_range (int): another paramter used to distinguish the floor. 
+                     The depth of the object should be no higher than (np.percentile(bkgd[bkgd!=0], percentile) - floor_range).
+                     Ie if the floor is ~ 500 - 520, and the object is 480, you might set range to 25 or so.
+        save_dir (string): where to save partial results plots
+        erosion_size (int): size of strel disk used at end to clean up the fit ROIs. Could be further parameterized into two different sizes. 
+    
+    Returns:
+        interp_bkgd (np.array): the new background image
+        best_plane (np.array): 4 parameters a,b,c,d for the best-fit plane
+        (yc, xc, a, b, orientation): tuple of parameters for skimage's ellipse
+    """
+    
+    
+    # Get outline of floor without the object
+    f = get_rough_floor(bkgd, percentile=floor_pctile, rng=floor_range)
+    
+    # Fit an ellipse (aiming for the true outline of the bucket)
+    (yc, xc, a, b, orientation) = get_floor_ellipse(f) # takes a few minutes
+    
+    # Save partial results for manual inspection
+    plot_fitted_floor_ellipse(f, yc, xc, a, b, orientation, save_dir=save_dir)
+    
+    # Interpolate plane onto the part of the bucket floor that we can see
+    masked_bkgd = deepcopy(bkgd)
+    masked_bkgd[~f] = 0 # depth values for the bucket floor that we can see
+    min_floor = 100*(np.floor(np.min(masked_bkgd[masked_bkgd!=0])/100))
+    max_floor = 100*(np.ceil(np.max(masked_bkgd)/100))
+    best_plane, dist = moseq2_extract.extract.roi.plane_ransac(masked_bkgd, 
+             bg_roi_depth_range=(min_floor, max_floor), iters=1000,
+             noise_tolerance=30, in_ratio=0.1,
+             progress_bar=True, mask=None)
+    
+    # Evaluate the interpolated plane across the entire image
+    ymax,xmax = f.shape
+    yy,xx = np.meshgrid(np.arange(0,ymax,1), np.arange(0,xmax,1))
+    yx = np.array([yy.flatten(), xx.flatten()]).T # N x 2 list of points (yi,xi): (y1,x1), (y2,x1), (y3,x1),...
+    zvals = eval_plane_z(best_plane, yx).reshape((ymax,xmax), order = 'F') # Fortran-order to fill columns ("y") first
+
+    
+    # Save partial results for manual inspection
+    plot_fitted_floor_plane(zvals, masked_bkgd, save_dir=save_dir)
+    
+    # Slot the zvals into the floor ROI
+    fdil = skimage.morphology.binary_erosion(f, disk(erosion_size)) # erode the floor ROI a bit, to help with the box's shadow
+    xx,yy = ellipse(yc, xc, a, b, rotation = orientation) # points within the fit ellipse
+    ellipse_mask = np.zeros(f.shape)
+    ellipse_mask[xx,yy] = 1
+    ellipse_mask = (ellipse_mask == 1)
+    ellipse_mask = skimage.morphology.binary_erosion(ellipse_mask, disk(erosion_size)) # erode ellipse ROI a bit to keep the bucket's walls intact
+    interp_bkgd = deepcopy(masked_bkgd)
+    interp_bkgd[ellipse_mask &  ~fdil] = zvals[ellipse_mask &  ~fdil]
+    
+    # Save results for manual inspection
+    plt.figure()
+    plt.imshow(interp_bkgd, vmin = np.min(interp_bkgd[interp_bkgd!=0]), vmax = np.max(interp_bkgd))
+    plt.colorbar()
+    plt.title('Interpolated background')
+    plt.savefig(join(save_dir, 'interp_bkgd.tiff'))
+    
+    return interp_bkgd, best_plane, (yc, xc, a, b, orientation)
+                  
+def eval_plane_z(params, yx):
+    """
+    Evaluates a plane ax+by+cz+d=0 at points (x,y)
+    Inputs:
+        params (np.array): a,b,c,d in ax+by+cz+d=0
+        yx (np.array): Nx2 points to evaluate. Each row is (y,x).
+    
+    So, z = (-1/c)(ax+by+d)
+    """
+    first_term = -1/params[2]
+    points = params[0]*yx[:,1] + params[1]*yx[:,0] + params[3] # this is the magic line, along with reshape(order='F')
+    return first_term*points
+
+def get_rough_floor(bkgd, percentile, rng):
+    aFloorVal = np.percentile(bkgd[bkgd!=0], percentile)
+#     roughFloorMask = np.logical_and((bkgd < (aFloorVal+rng)), bkgd > (aFloorVal-rng))
+    roughFloorMask = bkgd > (aFloorVal-rng)
+    return roughFloorMask
+
+def get_floor_ellipse(roughFloorMask, min_size=50, e_threshold=0.45):
+    """
+    Uses skimage.transform.hough_ellipse() to fit an ellipse to the inferred bucket floor.
+    The fit can be a bit slow.
+    Inputs: 
+        roughFloorMask (np.array): binary mask of floor
+        min_size (int): minimum size of ellipse major axis.
+        e_threshold: minimum eccentricity to be considered a good fit. Chosen by manual inspection.
+    Returns:
+        xc: x-coord of center
+        yc: y-coord of center
+        a: major axis len
+        b: minor axis len
+        orientation: orientation for the ellipse's major axis
+    """
+    
+    # Get algorithm input
+    image = img_as_ubyte(roughFloorMask)
+    edges = canny(image, sigma=3, low_threshold=10, high_threshold=50)
+    
+    # Run skimage algorithm
+    result = hough_ellipse(edges, accuracy=20, threshold=250,
+                           min_size=min_size)
+    result.sort(order='accumulator') # List of estimated parameters for each fit ellipse
+    
+    # Re-run if result is empty, bc threshold is too low
+    thresh = 250
+    while len(result) == 0:
+        thresh -= 50
+        result = hough_ellipse(edges, accuracy=20, threshold=thresh,
+                           min_size=min_size)
+        result.sort(order='accumulator') # List of estimated para
+    
+    
+    # Sometimes with lower thresholds, the best fit is wrong.
+    # Luckily these bad fits tend to be more eccentric than the right fit, so we can filter.
+    
+    # First, look at the best fit, and if it's the right eccentricity, take it.
+    # Otherwise, go backwards through best fits until we find one that works.
+    best = list(result[-1])
+    yc, xc, a, b = [int(round(x)) for x in best[1:5]]
+    orientation = best[5]
+    ratio_best = (b**2)/(a**2) # sometimes a and b are flipped, so check for that.
+    if ratio_best > 1:
+        ratio_best = ratio_best**-1
+    ecc_current = np.sqrt(1 - ratio_best)
+    ii = -1
+    while ecc_current > e_threshold:
+        ii -= 1
+        next_params = list(result[ii])
+        yc, xc, a, b = [int(round(x)) for x in next_params[1:5]]
+        orientation = next_params[5]
+        ratio_best = (b**2)/(a**2) # sometimes a and b are flipped, so check for that.
+        if ratio_best > 1:
+            ratio_best = ratio_best**-1
+        ecc_current = np.sqrt(1 - ratio_best)
+    
+    return (yc,xc,a,b,orientation)
+    
+
+def plot_fitted_floor_ellipse(roughFloorMask, yc, xc, a, b, orientation, save_dir):
+    image = img_as_ubyte(roughFloorMask)
+    edges = canny(image, sigma=3, low_threshold=10, high_threshold=50)
+
+    # Draw the ellipse on the original image
+    cy, cx = ellipse_perimeter(yc, xc, a, b, orientation)
+    image[cy, cx] = 150
+
+    # Draw the edge (white) and the resulting ellipse (red)
+    edges = color.gray2rgb(img_as_ubyte(edges))
+    edges[cy, cx] = (250, 0, 0)
+
+    fig2, (ax1, ax2) = plt.subplots(ncols=2, nrows=1, figsize=(8, 4),
+                                    sharex=True, sharey=True)
+    ax1.set_title('Original picture')
+    ax1.imshow(image)
+    ax2.set_title('Edge (white) and result (red)')
+    ax2.imshow(edges)
+    plt.savefig(join(save_dir, 'elliptical_background.tiff'))
+    return
+
+
+def plot_fitted_floor_plane(zvals, masked_bkgd, save_dir):
+    # Do some visual verifications
+    min_val = np.min([np.min(zvals), np.min(masked_bkgd[masked_bkgd!=0])])
+    max_val = np.max([np.max(zvals), np.max(masked_bkgd)])
+    plt.figure()
+    plt.subplot(1,2,1)
+    plt.imshow(zvals, vmin = min_val, vmax = max_val, cmap = 'jet')
+    plt.colorbar()
+    plt.title('Fit plane')
+    plt.subplot(1,2,2)
+    plt.imshow(masked_bkgd, vmin = min_val, vmax = max_val, cmap = 'jet')
+    plt.title('Masked background')
+    plt.savefig(join(save_dir, 'fit_floor_plane.tiff'))
+    return
+
+
+# End object-removal functions
+                  
 
 def get_bbox(roi):
     '''
