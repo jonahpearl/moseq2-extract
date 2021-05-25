@@ -7,6 +7,7 @@ import math
 import joblib
 import scipy.stats
 import numpy as np
+import matplotlib.pyplot as plt
 import scipy.signal
 import scipy.interpolate
 import skimage.measure
@@ -21,6 +22,7 @@ from tqdm.auto import tqdm
 import moseq2_extract.io.video
 import moseq2_extract.extract.roi
 from os.path import exists, join, dirname
+from os import makedirs
 from moseq2_extract.io.image import read_image, write_image
 from moseq2_extract.util import convert_pxs_to_mm, strided_app
 
@@ -141,7 +143,7 @@ def get_bground_im_file(frames_file, frame_stride=500, med_scale=5, output_dir=N
         # JP edit
         if kwargs.get('remove_obj_from_bg', False):
             
-            print('Removing object from background via RANSAC plane interpolation... (takes a few mins)'
+            print('Removing object from background via RANSAC plane interpolation... (takes a few mins)')
             
             # Get any relevant params passed, otherwise set defaults (are also set within the fns)
             floor_pctile = kwargs.pop('floor_pctile', 99)
@@ -153,9 +155,14 @@ def get_bground_im_file(frames_file, frame_stride=500, med_scale=5, output_dir=N
                 obj_removal_path = join(dirname(frames_file), 'proc', 'obj_removal')
             else:
                 obj_removal_path = join(output_dir, 'obj_removal')
-                
+ 
+            try:
+                makedirs(obj_removal_path, exist_ok=False)
+            except FileExistsError:
+                pass
+  
             # Run the algorithm to interpolate the floor (RANSAC plane) underneath the object
-            interp_bkgd, best_plane, ellipse_params = interp_elliptical_floor(bkgd, save_dir=obj_removal_path)
+            interp_bkgd, best_plane, ellipse_params = interp_elliptical_floor(bground, save_dir=obj_removal_path)
             bground = interp_bkgd
             
         write_image(bground_path, bground, scale=True)
@@ -218,12 +225,12 @@ def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.',
     plot_fitted_floor_plane(zvals, masked_bkgd, save_dir=save_dir)
     
     # Slot the zvals into the floor ROI
-    fdil = skimage.morphology.binary_erosion(f, disk(erosion_size)) # erode the floor ROI a bit, to help with the box's shadow
+    fdil = skimage.morphology.binary_erosion(f, skimage.morphology.disk(erosion_size)) # erode the floor ROI a bit, to help with the box's shadow
     xx,yy = ellipse(yc, xc, a, b, rotation = orientation) # points within the fit ellipse
     ellipse_mask = np.zeros(f.shape)
     ellipse_mask[xx,yy] = 1
     ellipse_mask = (ellipse_mask == 1)
-    ellipse_mask = skimage.morphology.binary_erosion(ellipse_mask, disk(erosion_size)) # erode ellipse ROI a bit to keep the bucket's walls intact
+    ellipse_mask = skimage.morphology.binary_erosion(ellipse_mask, skimage.morphology.disk(erosion_size)) # erode ellipse ROI a bit to keep the bucket's walls intact
     interp_bkgd = deepcopy(masked_bkgd)
     interp_bkgd[ellipse_mask &  ~fdil] = zvals[ellipse_mask &  ~fdil]
     

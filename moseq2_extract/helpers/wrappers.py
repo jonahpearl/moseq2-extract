@@ -16,7 +16,7 @@ from copy import deepcopy
 import ruamel.yaml as yaml
 from tqdm.auto import tqdm
 from cytoolz import partial
-from moseq2_extract.io.image import write_image
+from moseq2_extract.io.image import write_image, read_image
 from moseq2_extract.helpers.extract import process_extract_batches
 from moseq2_extract.extract.proc import get_roi, get_bground_im_file
 from os.path import join, exists, dirname, basename, abspath, splitext
@@ -185,8 +185,13 @@ def get_roi_wrapper(input_file, config_data, output_dir=None):
     config_data = detect_and_set_camera_parameters(config_data, input_file)
 
     print('Getting background...')
-    bground_im = get_bground_im_file(input_file, **config_data)
-    write_image(join(output_dir, 'bground.tiff'), bground_im, scale=True)
+    bground_name = join(output_dir, 'bground.tiff')
+    if exists(bground_name):
+        print('Background img exists, loading it...')
+        bground_im = read_image(bground_name, scale=True)
+    else:
+        bground_im = get_bground_im_file(input_file, **config_data)
+        write_image(bground_name, bground_im, scale=True)
 
     # readjust depth range
     if config_data['bg_roi_depth_range'] == 'auto':

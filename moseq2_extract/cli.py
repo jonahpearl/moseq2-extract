@@ -86,6 +86,10 @@ def common_roi_options(function):
         function)
     function = click.option("--config-file", type=click.Path())(function)
     function = click.option('--progress-bar', '-p', is_flag=True, help='Show verbose progress bars.')(function)
+    
+    # JP edit
+    function = click.option('--remove_obj_from_bg', is_flag=True,
+                           help='Use RANSAC plane to interpolate the bucket under a stationary object.')(function)
     return function
 
 def common_avi_options(function):
