@@ -96,7 +96,7 @@ def make_output_movie(results, config_data, offset=0):
 
 
 def process_extract_batches(input_file, config_data, bground_im, roi,
-                            frame_batches, str_els, output_mov_path,
+                            frame_batches, str_els, output_mov_path, output_dir=None,
                             scalars=None, h5_file=None, video_pipe=None, **kwargs):
     '''
     Compute extracted frames and save them to h5 files and avi files.
@@ -134,6 +134,7 @@ def process_extract_batches(input_file, config_data, bground_im, roi,
         offset = config_data['chunk_overlap'] if i > 0 else 0
 
         # Get crop-rotated frame batch
+        
         results = extract_chunk(**config_data,
                                 **str_els,
                                 chunk=raw_chunk,

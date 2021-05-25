@@ -8,6 +8,7 @@ import joblib
 import scipy.stats
 import numpy as np
 import matplotlib.pyplot as plt
+import pickle
 import scipy.signal
 import scipy.interpolate
 import skimage.measure
@@ -136,8 +137,6 @@ def get_bground_im_file(frames_file, frame_stride=500, med_scale=5, output_dir=N
                                                           **kwargs).squeeze()
             frame_store.append(cv2.medianBlur(frs, med_scale))
 
-        
-        
         bground = np.nanmedian(frame_store, axis=0)
         
         # JP edit
@@ -162,11 +161,18 @@ def get_bground_im_file(frames_file, frame_stride=500, med_scale=5, output_dir=N
                 pass
   
             # Run the algorithm to interpolate the floor (RANSAC plane) underneath the object
-            interp_bkgd, best_plane, ellipse_params = interp_elliptical_floor(bground, save_dir=obj_removal_path)
+            interp_bkgd, best_plane, ellipse_params, floor_roi, box_roi, mean_box_height = interp_elliptical_floor(bground, erosion_size=erosion_size, save_dir=obj_removal_path)
             bground = interp_bkgd
-            
+
+            # Save ROI info
+            with open(join(obj_removal_path, 'obj_removal_info.p'), 'wb') as f:
+                pickle.dump((floor_roi, box_roi, mean_box_height), f)
+
+        # Save background if we just calculated it
         write_image(bground_path, bground, scale=True)
-    else:
+
+    else: # if background image already existed
+        print('Background already exists, reloading...')
         bground = read_image(bground_path, scale=True)
         
     return bground
@@ -192,6 +198,9 @@ def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.',
         interp_bkgd (np.array): the new background image
         best_plane (np.array): 4 parameters a,b,c,d for the best-fit plane
         (yc, xc, a, b, orientation): tuple of parameters for skimage's ellipse
+        f: floor mask
+        box_roi: box mask
+        mean_box_height: average depth of bkgd pixels within box mask (for later use to find mouse above box)
     """
     
     
@@ -226,14 +235,20 @@ def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.',
     
     # Slot the zvals into the floor ROI
     fdil = skimage.morphology.binary_erosion(f, skimage.morphology.disk(erosion_size)) # erode the floor ROI a bit, to help with the box's shadow
-    xx,yy = ellipse(yc, xc, a, b, rotation = orientation) # points within the fit ellipse
+    xx, yy = ellipse(yc, xc, a, b, rotation=orientation)  # points within the fit ellipse
     ellipse_mask = np.zeros(f.shape)
-    ellipse_mask[xx,yy] = 1
+    ellipse_mask[xx, yy] = 1
     ellipse_mask = (ellipse_mask == 1)
     ellipse_mask = skimage.morphology.binary_erosion(ellipse_mask, skimage.morphology.disk(erosion_size)) # erode ellipse ROI a bit to keep the bucket's walls intact
     interp_bkgd = deepcopy(masked_bkgd)
-    interp_bkgd[ellipse_mask &  ~fdil] = zvals[ellipse_mask &  ~fdil]
-    
+    interp_bkgd[ellipse_mask & ~fdil] = zvals[ellipse_mask &  ~fdil]
+
+    # Make box roi the long way (shorter way gave wrong shape?)
+    box_roi = np.zeros(f.shape)
+    box_roi[ellipse_mask & ~fdil] = 1
+    box_roi = (box_roi == 1)
+    mean_box_height = np.mean(bkgd[box_roi])
+
     # Save results for manual inspection
     plt.figure()
     plt.imshow(interp_bkgd, vmin = np.min(interp_bkgd[interp_bkgd!=0]), vmax = np.max(interp_bkgd))
@@ -241,7 +256,7 @@ def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.',
     plt.title('Interpolated background')
     plt.savefig(join(save_dir, 'interp_bkgd.tiff'))
     
-    return interp_bkgd, best_plane, (yc, xc, a, b, orientation)
+    return interp_bkgd, best_plane, (yc, xc, a, b, orientation), f, box_roi, mean_box_height
                   
 def eval_plane_z(params, yx):
     """
@@ -545,9 +560,16 @@ def apply_roi(frames, roi):
     # yeah so fancy indexing slows us down by 3-5x
     cropped_frames = frames*roi
     bbox = get_bbox(roi)
-
     cropped_frames = cropped_frames[:, bbox[0, 0]:bbox[1, 0], bbox[0, 1]:bbox[1, 1]]
     return cropped_frames
+
+def apply_roi_to_mask(mask, roi):
+    """
+    Same as apply_roi(), but takes a 2D mask and shrinks it
+    """
+    bbox = get_bbox(roi)
+    cropped_mask = mask[bbox[0, 0]:bbox[1, 0], bbox[0, 1]:bbox[1, 1]]
+    return cropped_mask
 
 
 def im_moment_features(IM):
@@ -635,7 +657,8 @@ def clean_frames(frames, prefilter_space=(3,), prefilter_time=None,
 
 
 def get_frame_features(frames, frame_threshold=10, mask=np.array([]),
-                       mask_threshold=-30, use_cc=False, progress_bar=False):
+                       mask_threshold=-30, use_cc=False, progress_bar=False,
+                       roi=None, **kwargs):
     '''
     Use image moments to compute features of the largest object in the frame
 
@@ -647,7 +670,7 @@ def get_frame_features(frames, frame_threshold=10, mask=np.array([]),
     mask_threshold (int): threshold to include regions into mask.
     use_cc (bool): Use connected components.
     progress_bar (bool): Display progress bar.
-
+    roi: the roi for the raw data, to crop other masks if required
     Returns
     -------
     features (dict of lists): dictionary with simple image features
@@ -671,14 +694,47 @@ def get_frame_features(frames, frame_threshold=10, mask=np.array([]),
     }
 
     for i in tqdm(range(nframes), disable=not progress_bar, desc='Computing moments'):
+        
+        
         # Threshold frame to compute mask
-        frame_mask = frames[i] > frame_threshold
+        # Special case (object removal)
+        if kwargs.get('remove_obj_from_bg', False): 
+            print('Using special case for frame thresholding (obj removal)')
+            
+            obj_removal_path = join(kwargs.get('output_dir'), 'obj_removal')
+            with open(join(obj_removal_path, 'obj_removal_info.p'), 'rb') as f:
+                floor_mask, box_mask, mean_box_height = pickle.load(f)
+            
+            floor_mask = apply_roi_to_mask(floor_mask, roi)
+            box_mask = apply_roi_to_mask(box_mask, roi)
+
+            floor_threshold = frame_threshold
+            box_threshold = frame_threshold + mean_box_height
+            floor_accept = (frames[i] > floor_threshold) & (floor_mask)
+            box_accept = (frames[i] > box_threshold) & (box_mask)
+            frame_mask = frames[i][floor_accept & box_accept]
+
+        # Typical case
+        else: 
+            frame_mask = frames[i] > frame_threshold
+
+        print(frame_mask.shape)
 
         # Incorporate largest connected component with frame mask
-        if use_cc:
+        if use_cc and not (kwargs.get('remove_obj_from_bg', False)):
             cc_mask = get_largest_cc((frames[[i]] > mask_threshold).astype('uint8')).squeeze()
             frame_mask = np.logical_and(cc_mask, frame_mask)
+        elif use_cc and (kwargs.get('remove_obj_from_bg', False)):
+            floor_threshold = mask_threshold
+            box_threshold = mask_threshold + mean_box_height
+            floor_accept = (frames[i] > floor_threshold) & (floor_mask)
+            box_accept = (frames[i] > box_threshold) & (box_mask)
+            tmp = frames[i][floor_accept & box_accept]
+            cc_mask = get_largest_cc(tmp.astype('uint8')).squeeze()
+            frame_mask = np.logical_and(cc_mask, frame_mask)
 
+
+        print(frame_mask.shape)
         # Apply mask
         if has_mask:
             frame_mask = np.logical_and(frame_mask, mask[i] > mask_threshold)

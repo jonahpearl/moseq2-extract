@@ -108,7 +108,7 @@ def extract_chunk(chunk, use_tracking_model=False, spatial_filter_size=(3,),
         # Threshold chunk depth values at min and max heights
         chunk = threshold_chunk(chunk, min_height, max_height).astype(frame_dtype)
 
-    # Apply ROI mask
+    # Apply ROI mask (changes shape of chunk from raw shape)
     if roi is not None:
         chunk = apply_roi(chunk, roi)
 
@@ -142,7 +142,9 @@ def extract_chunk(chunk, use_tracking_model=False, spatial_filter_size=(3,),
                                         frame_threshold=min_height, mask=ll,
                                         mask_threshold=mask_threshold,
                                         use_cc=use_cc,
-                                        progress_bar=progress_bar)
+                                        progress_bar=progress_bar,
+                                        roi=roi,
+                                        **kwargs)
 
     incl = ~np.isnan(features['orientation'])
     features['orientation'][incl] = np.unwrap(features['orientation'][incl] * 2) / 2

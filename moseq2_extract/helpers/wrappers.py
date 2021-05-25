@@ -185,13 +185,16 @@ def get_roi_wrapper(input_file, config_data, output_dir=None):
     config_data = detect_and_set_camera_parameters(config_data, input_file)
 
     print('Getting background...')
-    bground_name = join(output_dir, 'bground.tiff')
-    if exists(bground_name):
-        print('Background img exists, loading it...')
-        bground_im = read_image(bground_name, scale=True)
-    else:
-        bground_im = get_bground_im_file(input_file, **config_data)
-        write_image(bground_name, bground_im, scale=True)
+    bground_im = get_bground_im_file(input_file, **config_data)
+    
+    # bground_name = join(output_dir, 'bground.tiff')
+    # if exists(bground_name):
+    #     print('Background img exists, loading it...')
+    #     print('Hey this edit was made in VS code over SSH!')
+    #     bground_im = read_image(bground_name, scale=True)
+    # else:
+    #     bground_im = get_bground_im_file(input_file, **config_data)
+    #     write_image(bground_name, bground_im, scale=True)
 
     # readjust depth range
     if config_data['bg_roi_depth_range'] == 'auto':
@@ -371,7 +374,8 @@ def extract_wrapper(input_file, output_dir, config_data, num_frames=None, skip=F
                                 config_data=config_data,
                                 scalars=scalars,
                                 str_els=str_els,
-                                output_mov_path=movie_filename)
+                                output_mov_path=movie_filename,
+                                output_dir=output_dir)
 
     print()
 
