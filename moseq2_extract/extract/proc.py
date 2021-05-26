@@ -9,6 +9,7 @@ import scipy.stats
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
+import pdb
 import scipy.signal
 import scipy.interpolate
 import skimage.measure
@@ -203,7 +204,6 @@ def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.',
         mean_box_height: average depth of bkgd pixels within box mask (for later use to find mouse above box)
     """
     
-    
     # Get outline of floor without the object
     f = get_rough_floor(bkgd, percentile=floor_pctile, rng=floor_range)
     
@@ -247,7 +247,8 @@ def interp_elliptical_floor(bkgd, floor_pctile=99, floor_range=50, save_dir='.',
     box_roi = np.zeros(f.shape)
     box_roi[ellipse_mask & ~fdil] = 1
     box_roi = (box_roi == 1)
-    mean_box_height = np.mean(bkgd[box_roi])
+    box_roi = get_largest_cc((box_roi[np.newaxis,:]).astype('uint8')).squeeze() # requires 3D, uint8 input
+    mean_box_height = np.abs(np.mean(bkgd[box_roi]) - np.mean(zvals[ellipse_mask &  ~fdil]))
 
     # Save results for manual inspection
     plt.figure()
@@ -697,28 +698,32 @@ def get_frame_features(frames, frame_threshold=10, mask=np.array([]),
         
         
         # Threshold frame to compute mask
-        # Special case (object removal)
         if kwargs.get('remove_obj_from_bg', False): 
-            print('Using special case for frame thresholding (obj removal)')
             
+            # Object removal special case: use different heights for floor / object
+            # Assumes object has a flat surface of depth mean_box_height
+            if i == 1:
+                print('Using special case for frame thresholding (obj removal)')
+            
+            # Get floor / box masks
             obj_removal_path = join(kwargs.get('output_dir'), 'obj_removal')
             with open(join(obj_removal_path, 'obj_removal_info.p'), 'rb') as f:
                 floor_mask, box_mask, mean_box_height = pickle.load(f)
             
+            # Crop the masks to match the cropped frame
             floor_mask = apply_roi_to_mask(floor_mask, roi)
             box_mask = apply_roi_to_mask(box_mask, roi)
 
+            # Get frame mask 
             floor_threshold = frame_threshold
-            box_threshold = frame_threshold + mean_box_height
+            box_threshold = frame_threshold + abs(mean_box_height) + 5
             floor_accept = (frames[i] > floor_threshold) & (floor_mask)
             box_accept = (frames[i] > box_threshold) & (box_mask)
-            frame_mask = frames[i][floor_accept & box_accept]
+            frame_mask = (floor_accept | box_accept)
 
-        # Typical case
         else: 
+            # Typical case
             frame_mask = frames[i] > frame_threshold
-
-        print(frame_mask.shape)
 
         # Incorporate largest connected component with frame mask
         if use_cc and not (kwargs.get('remove_obj_from_bg', False)):
@@ -729,12 +734,10 @@ def get_frame_features(frames, frame_threshold=10, mask=np.array([]),
             box_threshold = mask_threshold + mean_box_height
             floor_accept = (frames[i] > floor_threshold) & (floor_mask)
             box_accept = (frames[i] > box_threshold) & (box_mask)
-            tmp = frames[i][floor_accept & box_accept]
-            cc_mask = get_largest_cc(tmp.astype('uint8')).squeeze()
+            tmp = (floor_accept | box_accept)
+            cc_mask = get_largest_cc((tmp[np.newaxis,:]).astype('uint8')).squeeze()
             frame_mask = np.logical_and(cc_mask, frame_mask)
 
-
-        print(frame_mask.shape)
         # Apply mask
         if has_mask:
             frame_mask = np.logical_and(frame_mask, mask[i] > mask_threshold)
@@ -747,8 +750,22 @@ def get_frame_features(frames, frame_threshold=10, mask=np.array([]),
 
         if tmp.size == 0:
             continue
+        
+        if kwargs.get('remove_obj_from_bg', False):
+            # Object removal special case: deal with annoying large shadows
+            enclosing_radii = np.array([cv2.minEnclosingCircle(x)[1] for x in cnts])
+            radius_threshold = 50 # mouse encl. circle is no bigger than this
+            possible_mice = enclosing_radii < radius_threshold
+            try:
+                mouse_cnt = np.where(tmp == tmp[possible_mice].max())[0][0]
+            except:
+                print(f'No acceptable contour found in frame {i}, skipping...')
+                continue
+        else:
+            mouse_cnt = tmp.argmax()
 
-        mouse_cnt = tmp.argmax()
+        # if i == 50:
+        #     pdb.set_trace()
 
         # Get features from contours
         for key, value in im_moment_features(cnts[mouse_cnt]).items():
